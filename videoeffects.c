@@ -227,8 +227,8 @@ static void append_vf(char *dst, size_t n, int fx, const char *param, const char
     case FX_ROTATE:
         _snprintf(p, rem, "rotate=%s*3.141592653589793/180", param);
         break;
-    case FX_FISHEYE:
-        _snprintf(p, rem, "format=yuv444p16le,geq='p(W*0.5+(X-W*0.5)*max(1-(%s)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0),H*0.5+(Y-H*0.5)*max(1-(%s)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0))',scale=iw:ih,format=yuv420p",
+    case FX_PINCHPUNCH:
+        _snprintf(p, rem, "format=yuv444p16le,scale=ih:ih,geq='p(W*0.5+(X-W*0.5)*(1-($s*0.8)*(1-(3*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^2-2*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^3))),H*0.5+(Y-H*0.5)*(1-($s*0.8)*(1-(3*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^2-2*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^3))))':interpolation=bilinear,scale=iw:ih,format=yuv420p",
                   param, param);
         break;
     case FX_STRETCH: {
