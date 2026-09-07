@@ -1,0 +1,706 @@
+#!/usr/bin/env bash
+# videoeffects.sh - apply effects to images and videos
+#
+# Install:
+#   curl -fsSL <URL>/videoeffects.sh -o videoeffects.sh
+#   bash videoeffects.sh install
+#   videoeffects --help
+#
+# Or run directly without installing:
+#   bash videoeffects.sh in.png out.png --invert --fisheye 1 --hsv 180,0,0
+#
+# Requires: ffmpeg, ffprobe and ImageMagick (magick) on PATH.
+set -euo pipefail
+
+HIDE=0
+INPUT=""
+OUTPUT=""
+FX_TYPES=()
+FX_PARAMS=()
+CLEANUP=""
+# Intermediate-frame format for video passes; set by detect_frame_format().
+FRAME_EXT="${FRAME_EXT:-}"
+FRAME_CODEC=""
+FRAME_CODEC_OPTS=""
+
+log() { [ "$HIDE" -eq 0 ] && printf '[videoeffects] %s\n' "$*"; true; }
+err() { printf 'videoeffects: error: %s\n' "$*" >&2; exit 1; }
+
+run() {
+    [ "$HIDE" -eq 0 ] && printf '[videoeffects] exec: %s\n' "$*"
+    "$@" || { err "command failed: $*"; exit 1; }
+}
+
+cleanup() { [ -n "$CLEANUP" ] && rm -rf "$CLEANUP"; true; }
+trap cleanup EXIT
+
+is_num() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; }
+is_csv() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?([,;]-?[0-9]+(\.[0-9]+)?)*$ ]]; }
+is_size() { [[ "$1" =~ ^[0-9]+([xX][0-9]+)?%?$ ]]; }
+
+ext() { printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]'; }
+
+is_img() { case "$(ext "$1")" in png|jpg|jpeg|gif) return 0;; esac; return 1; }
+is_vid() { case "$(ext "$1")" in mp4|mov|mxf|mkv|avi) return 0;; esac; return 1; }
+
+fx_name() {
+    case "$1" in
+        invert) echo invert;; invertlum) echo invertlum;; fisheye) echo fisheye;;
+        hsv) echo hsv;; hue) echo hue;; explode) echo explode;; swirl) echo swirl;;
+        hflip) echo hflip;; vflip) echo vflip;; rotate) echo rotate;; magik) echo magik;;
+        haah) echo haah;; waaw) echo waaw;; hooh) echo hooh;; woow) echo woow;;
+        stretch) echo stretch;; resize) echo resize;; derain) echo derain;;
+        rain) echo rain;; bgr) echo bgr;; wave) echo wave;;
+    esac
+}
+
+fx_file() { echo "effects/$(fx_name "$1").c"; }
+
+add_fx() { FX_TYPES+=("$1"); FX_PARAMS+=("${2:-}"); }
+
+# Effects that can be expressed purely as ffmpeg filters. When every requested
+# effect is in this set, videos are processed with a single ffmpeg command and
+# no intermediate frames are written at all.
+uses_ffmpeg() {
+    case "$1" in invert|bgr|fisheye|hflip|vflip|rotate|stretch|wave|haah|waaw|hooh|woow|resize|hue) return 0;; esac
+    return 1
+}
+
+help() {
+    cat <<'EOF'
+videoeffects - apply effects to images and videos
+
+Usage:
+  videoeffects <input> <output> [effects...] [options]
+
+Effects:
+  --invert              Negate colors (ffmpeg -vf negate style)
+  --invertlum           Invert luminosity in LAB colorspace
+                        (ImageMagick -colorspace lab -channel r -negate style)
+  --pinchpunch [strength]  Pinch/Punch distortion, default 0.5 (ffmpeg geq style)
+  --hsv H,S,V           Hue shift in degrees, saturation and value shifts
+                        (0 = no change). e.g. --hsv 180,0,0
+                        (ImageMagick -modulate style)
+  --hue [degrees]       Rotate hue in degrees, default 90 (HALD LUT
+                        rotation of the YUV color plane, ImageMagick fx
+                        + ffmpeg haldclut style)
+  --explode [strength]  Explode outward, default 1.0 (-implode style)
+  --swirl [strength]    Swirl in degrees, default 45 (-swirl style)
+  --hflip               Mirror horizontally (ffmpeg -vf hflip)
+  --vflip               Mirror vertically (ffmpeg -vf vflip)
+  --rotate [degrees]    Rotate by degrees, default 90 (ffmpeg -vf rotate)
+  --magik               Liquid-rescale to 50%x50%, then resize 200%
+  --haah                Mirror left half onto right (ffmpeg crop/hflip/hstack)
+  --waaw                Flop, then mirror left half onto right
+  --hooh                Rotate 90, mirror half, rotate back
+  --woow                Rotate 90 + flop, mirror half, rotate back
+  --stretch [x,y]       Stretch/squeeze horizontally and vertically,
+                        default 1.1,1.1 (ffmpeg geq style)
+                        numbers separated by , or ;
+  --resize [WxH|W|N%]   Resize with ffmpeg scale, e.g. 1280x720, 500, 50%
+  --derain              Fake derain color trick (ImageMagick colorspace)
+  --rain                Fake rain color trick (ImageMagick colorspace)
+  --bgr                 Swap color channels to BGR (ffmpeg colorchannelmixer)
+  --wave [params]       Sinusoidal wave distortion (ffmpeg geq style).
+                        params: xfreq,yfreq,xamp,yamp,xphase,yphase[,xspeed,yspeed]
+                        default 3.2,3.2,0.05,0.05,0.628,0.628,0,0
+                        numbers separated by , or ;
+
+Options:
+  --hidelogs            Hide progress logs
+  --help                Show this help and exit
+  install               Copy this script into your PATH (self-install)
+
+Supported formats:
+  Images: .png .jpg .jpeg .gif
+  Videos: .mp4 .mov .mxf .mkv .avi
+
+Videos whose effects are all expressible as ffmpeg filters are encoded in a
+single pass with no intervideote files. When ImageMagick is required, frames
+are extracted as lossless intermediate frames (JPEG 2000 when ImageMagick
+supports it, otherwise PNG; override with FRAME_EXT=jp2|png), processed in
+parallel chunks, and reassembled with ffmpeg.
+
+Effect source code is generated into the effects/ folder
+(invert.c, invertlum.c, pinchpunch.c, hsv.c, hue.c, explode.c, swirl.c, hflip.c,
+vflip.c, rotate.c, magik.c, haah.c, waaw.c, hooh.c, woow.c, stretch.c,
+resize.c, derain.c, rain.c, bgr.c, wave.c).
+
+Examples:
+  videoeffects in.png out.png --invert
+  videoeffects in.png out.png --invert --fisheye 1 --hsv 180,0,0
+  videoeffects clip.mp4 out.mp4 --fisheye 0.5 --hsv 45,20,-10
+EOF
+}
+
+install_me() {
+    local src="$0" dest
+    if [ ! -f "$src" ]; then
+        printf 'videoeffects: cannot self-install while streaming (curl | bash).\n' >&2
+        printf 'Download it first, then install:\n' >&2
+        printf '  curl -fsSL <URL>/videoeffects.sh -o videoeffects.sh\n' >&2
+        printf '  bash videoeffects.sh install\n' >&2
+        exit 1
+    fi
+    if [ "$(id -u)" -eq 0 ] && [ -d /usr/local/bin ]; then
+        dest=/usr/local/bin/videoeffects
+    else
+        mkdir -p "$HOME/.local/bin" || true
+        dest="$HOME/.local/bin/videoeffects"
+    fi
+    cp "$src" "$dest"
+    chmod +x "$dest"
+    printf 'Installed videoeffects to %s\n' "$dest"
+    printf 'Now run: videoeffects --help\n'
+}
+
+pinchpunch_vf() {
+    printf "format=yuv444p16le,scale=ih:ih,geq='p(W*0.5+(X-W*0.5)*(1-($s*0.8)*(1-(3*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^2-2*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^3))),H*0.5+(Y-H*0.5)*(1-($s*0.8)*(1-(3*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^2-2*min(1,hypot(X-W*0.5,Y-H*0.5)/(min(W,H)*0.5))^3))))',scale=%s,format=yuv420p" "$1" "${2//x/:}"
+}
+
+# stretch x,y: enlarge the canvas 1.1x, sample with /x and /y, crop back to
+# the input dimensions (dims = "WxH").
+stretch_vf() {
+    local p="$1" dims="$2" x y
+    x=${p%%,*}; y=${p#*,}
+    printf "format=yuv444p,rotate=0:iw*1.1:ih*1.1,geq='p((W/2)+(X-(W/2))/%s,(H/2)+(Y-(H/2))/%s)',scale=iw:ih,crop=%s,format=yuv420p" \
+        "$x" "$y" "${dims//x/:}"
+}
+
+# wave xfreq,yfreq,xamp,yamp,xphase,yphase,xspeed,yspeed: resample to a 640x640
+# square, apply a sinusoidal displacement, then scale back to the input dims.
+wave_vf() {
+    local p="$1" dims="$2" xf yf xa ya xp yp xs ys
+    IFS=, read -r xf yf xa ya xp yp xs ys <<< "$p"
+    printf "format=yuv444p,scale=640:640,geq='p(X-((sin((T*5*%s+(%s))+(Y/H)*(PI*%s)))*(-%s*600)),Y-((sin((T*5*%s+(%s))+(X/W)*(PI*%s)))*(-%s*600)))',scale=%s,format=yuv420p" \
+        "$xs" "$xp" "$xf" "$xa" "$ys" "$yp" "$yf" "$ya" "${dims//x/:}"
+}
+
+# resize WxH / W / N% -> ffmpeg scale filter (keeps aspect, even dims).
+resize_vf() {
+    local p="$1" W H pct
+    case "$p" in
+        *x*|*X*)
+            W=${p%%[xX]*}; H=${p##*[xX]}
+            echo "scale=$W:$H:force_original_aspect_ratio=decrease:force_divisible_by=2"
+            ;;
+        *%*)
+            pct=${p%\%}
+            echo "scale=trunc(iw*$pct/100/2)*2:trunc(ih*$pct/100/2)*2"
+            ;;
+        *)
+            echo "scale=$p:-2"
+            ;;
+    esac
+}
+
+# ffmpeg filter string for a single effect (dims = "WxH", only used by
+# stretch/wave which need to scale back to the source dimensions).
+ffmpeg_vf() {
+    case "$1" in
+        invert) echo "format=rgb24,negate";;
+        hflip) echo "hflip";;
+        vflip) echo "vflip";;
+        rotate) echo "rotate=${2}*3.141592653589793/180";;
+        fisheye) fisheye_vf "$2";;
+        stretch) stretch_vf "$2" "$3";;
+        wave) wave_vf "$2" "$3";;
+        bgr) echo "colorchannelmixer=rr=0:rg=0:rb=1:gr=0:gg=1:gb=0:br=1:bg=0:bb=0";;
+        hue) echo "hue=h=${2}";;
+        haah) echo "crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2";;
+        waaw) echo "hflip,crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2";;
+        hooh) echo "transpose=1,crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2,transpose=2";;
+        woow) echo "transpose=1,hflip,crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2,transpose=2";;
+        resize) resize_vf "$2";;
+    esac
+}
+
+# Normalize a wave parameter string to exactly 8 values (missing -> 0).
+pad_wave() {
+    local s="$1"
+    local -a a
+    IFS=, read -r -a a <<< "$s"
+    while [ "${#a[@]}" -lt 8 ]; do a+=("0"); done
+    echo "${a[0]},${a[1]},${a[2]},${a[3]},${a[4]},${a[5]},${a[6]},${a[7]}"
+}
+
+magick_arg() {
+    case "$1" in
+        invertlum) echo " -colorspace lab -channel r -negate +colorspace";;
+        hsv)
+            IFS=, read -r h s v <<< "$2"
+            read -r vp sp hp <<< "$(awk -v h="$h" -v s="$s" -v v="$v" \
+                'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
+            echo " -modulate $vp,$sp,$hp"
+            ;;
+        explode) echo " -implode $(awk -v a="$2" 'BEGIN { printf "%.4f", -a }')";;
+        swirl) echo " -swirl $2";;
+        magik) echo " -liquid-rescale 50%x50% -resize 200%";;
+        derain) echo " -colorspace srgb -set colorspace rgb -colorspace hsv -set colorspace rgb";;
+        rain) echo " -colorspace srgb -set colorspace hsv -colorspace scrgb -set colorspace srgb";;
+    esac
+}
+
+# Generate a 6-level HALD LUT (216x216 PPM) that rotates the YUV color plane
+# by <ang> degrees (ImageMagick YUV-space -fx). Applied with ffmpeg haldclut.
+make_hue_lut() {
+    local ang="$1" out="$2"
+    [ -f "$out" ] && return
+    run magick hald:6 -colorspace yuv \
+        -fx "angle=${ang}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" \
+        -colorspace srgb "$out"
+}
+
+# " -i <lut>" arguments for every HUE@ marker in a chain, in order. The LUT
+# paths are POSIX-style (no spaces) and unquoted so MSYS can translate them.
+hue_luts() {
+    local chain="$1" out="" f
+    IFS=, read -r -a frags <<< "$chain"
+    for f in "${frags[@]}"; do
+        [[ "$f" == HUE@* ]] && out+=" -i ${f#HUE@}"
+    done
+    echo "$out"
+}
+
+# Turn a comma-joined chain containing HUE@ markers into a -filter_complex
+# graph. Marker k uses input clutbase+k as its LUT. Always ends null[vout].
+hue_graph() {
+    local chain="$1" clutbase="$2" out="" cur="[0:v]" pending="" k=0 n=0 f
+    IFS=, read -r -a frags <<< "$chain"
+    for f in "${frags[@]}"; do
+        if [[ "$f" == HUE@* ]]; then
+            if [ -n "$pending" ]; then
+                out+="${cur}${pending}[h$((2 * k))];"
+                cur="[h$((2 * k))]"
+            fi
+            out+="${cur}[$((clutbase + n)):v]haldclut[h$((2 * k + 1))];"
+            cur="[h$((2 * k + 1))]"
+            k=$((k + 1)); n=$((n + 1)); pending=""
+        else
+            if [ -n "$pending" ]; then pending+=",$f"; else pending="$f"; fi
+        fi
+    done
+    if [ -n "$pending" ]; then
+        out+="${cur}${pending},null[vout]"
+    else
+        out+="${cur}null[vout]"
+    fi
+    echo "$out"
+}
+
+# Run one ffmpeg frame pass for a segment argument that may contain HUE@
+# markers (upgrading to -filter_complex with the LUTs as extra inputs).
+video_pass_ffmpeg() {
+    local dir="$1" cur="$2" next="$3" vf="$4" graph luts
+    if [[ "$vf" == *HUE@* ]]; then
+        luts=$(hue_luts "$vf")
+        graph=$(hue_graph "$vf" 1)
+        run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" $luts \
+            -filter_complex "$graph" -map "[vout]" \
+            -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$dir/${next}_%05d.$FRAME_EXT"
+    else
+        run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" -vf "$vf" \
+            -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$dir/${next}_%05d.$FRAME_EXT"
+    fi
+}
+
+# Group consecutive effects into segments of one kind ("ffmpeg" or "magick").
+# Consecutive ffmpeg effects are merged into a single filtergraph and
+# consecutive magick effects into a single ImageMagick command, so each pass
+# decodes/encodes the frames only once per kind switch. Hue merges into the
+# ffmpeg chain as a "HUE@<lut>" marker: at command-build time the chain is
+# upgraded to a -filter_complex that feeds the LUT as an extra input, so hue
+# never forces an extra frame pass.
+SEG_TYPES=()
+SEG_ARGS=()
+build_segments() {
+    local dims="$1" n=${#FX_TYPES[@]} i cur="" vf marg
+    SEG_TYPES=(); SEG_ARGS=()
+    for ((i = 0; i < n; i++)); do
+        if [ "${FX_TYPES[$i]}" = hue ]; then
+            [ -n "$CLEANUP" ] || CLEANUP=$(mktemp -d)
+            make_hue_lut "${FX_PARAMS[$i]}" "$CLEANUP/ccs_${FX_PARAMS[$i]}.ppm"
+            vf="HUE@$CLEANUP/ccs_${FX_PARAMS[$i]}.ppm"
+            if [ "$cur" = ffmpeg ]; then
+                SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]="${SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]},$vf"
+            else
+                cur=ffmpeg; SEG_TYPES+=("ffmpeg"); SEG_ARGS+=("$vf")
+            fi
+        elif uses_ffmpeg "${FX_TYPES[$i]}"; then
+            vf=$(ffmpeg_vf "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}" "$dims")
+            if [ "$cur" = ffmpeg ]; then
+                SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]="${SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]},$vf"
+            else
+                cur=ffmpeg; SEG_TYPES+=("ffmpeg"); SEG_ARGS+=("$vf")
+            fi
+        else
+            marg=$(magick_arg "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}")
+            if [ "$cur" = magick ]; then
+                SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]="${SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]}$marg"
+            else
+                cur=magick; SEG_TYPES+=("magick"); SEG_ARGS+=("$marg")
+            fi
+        fi
+    done
+}
+
+write_effect_c() {
+    local name="$1" p="$2" h s v vp sp hp neg
+    mkdir -p effects
+    case "$name" in
+        invert)
+            cat > effects/invert.c <<'EOF'
+/*
+ * invert.c
+ * Effect      : invert
+ * Description : negate colors
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf format=rgb24,negate <output>
+ *
+ * Style reference: ffmpeg negate filter (libavfilter/vf_negate.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string equivalent to: -vf format=rgb24,negate */
+const char *const videoeffects_invert_vf = "format=rgb24,negate";
+
+/* pixel-level operation: out = max - in */
+static unsigned int videoeffects_invert_pixel(unsigned int v, unsigned int max)
+{
+    return max - v;
+}
+EOF
+            ;;
+        invertlum)
+            cat > effects/invertlum.c <<'EOF'
+/*
+ * invertlum.c
+ * Effect      : invertlum
+ * Description : invert luminosity in LAB colorspace
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -colorspace lab -channel r -negate +colorspace <output>
+ *
+ * Style reference: ImageMagick -colorspace, -channel, -negate
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (negate the L channel of LAB) */
+const char *const videoeffects_invertlum_magick = "-colorspace lab -channel r -negate +colorspace";
+EOF
+            ;;
+        fisheye)
+            cat > effects/fisheye.c <<EOF
+/*
+ * fisheye.c
+ * Effect      : fisheye
+ * Strength    : $p
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf format=yuv444p16le,"geq='...'",scale=iw:ih,format=yuv420p <output>
+ *
+ * Style reference: ffmpeg geq filter (libavfilter/vf_geq.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string; samples source pixels via p(x,y) */
+const char *const videoeffects_fisheye_vf =
+    "format=yuv444p16le,"
+    "geq='p(W*0.5+(X-W*0.5)*max(1-($p)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0),"
+    "H*0.5+(Y-H*0.5)*max(1-($p)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0))',"
+    "scale=iw:ih,format=yuv420p";
+EOF
+            ;;
+        hsv)
+            IFS=, read -r h s v <<< "$p"
+            read -r vp sp hp <<< "$(awk -v h="$h" -v s="$s" -v v="$v" \
+                'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
+            cat > effects/hsv.c <<EOF
+/*
+ * hsv.c
+ * Effect      : hsv
+ * Hue         : $h deg shift (no change: 0)
+ * Saturation  : $s shift (no change: 0)
+ * Value       : $v shift (no change: 0)
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -modulate $vp,$sp,$hp <output>
+ *
+ * Style reference: ImageMagick -modulate brightness,saturation,hue
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (brightness,saturation,hue percent) */
+const char *const videoeffects_hsv_magick = "-modulate $vp,$sp,$hp";
+EOF
+            ;;
+        hue)
+            cat > effects/hue.c <<EOF
+/*
+ * hue.c
+ * Effect      : hue
+ * Angle       : $p degrees
+ * Generated by: videoeffects
+ *
+ * The hue rotation is a rotation of the color plane in YUV space, applied
+ * through a 6-level HALD LUT built with ImageMagick's -fx math. This keeps
+ * the effect chroma rotation in YUV space (same as ffmpeg's hue filter, which
+ * operates in HSV) while matching the reference ImageMagick implementation.
+ *
+ * CLI equivalents:
+ *   # two-input haldclut (portable, used by videoeffects):
+ *   magick hald:6 -colorspace yuv \\
+ *     -fx "angle=${p}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" \\
+ *     -colorspace srgb ccs_${p}.ppm
+ *   ffmpeg -i <input> -i ccs_${p}.ppm \\
+ *     -filter_complex "[0:v][1:v]haldclut[vout]" -map "[vout]" <output>
+ *   # single-input -vf form (POSIX paths only):
+ *   ffmpeg -i <input> -vf "movie=ccs_${p}.ppm,[in]haldclut" <output>
+ *
+ * Style reference: ImageMagick -fx YUV color-plane rotation
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string (requires the HALD LUT as a second input) */
+const char *const videoeffects_hue_vf = "[0:v][1:v]haldclut";
+EOF
+            ;;
+        explode)
+            neg=$(awk -v a="$p" 'BEGIN { printf "%.4f", -a }')
+            cat > effects/explode.c <<EOF
+/*
+ * explode.c
+ * Effect      : explode
+ * Strength    : $p
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -implode $neg <output>
+ *
+ * Style reference: ImageMagick -implode (negative = explode)
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (strength is negated for explode) */
+const char *const videoeffects_explode_magick = "-implode $neg";
+EOF
+            ;;
+        swirl)
+            cat > effects/swirl.c <<EOF
+/*
+ * swirl.c
+ * Effect      : swirl
+ * Degrees     : $p
+ * Generated by: videoeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -swirl $p <output>
+ *
+ * Style reference: ImageMagick -swirl
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const videoeffects_swirl_magick = "-swirl $p";
+EOF
+            ;;
+    esac
+}
+
+process_image() {
+    local segs="${#SEG_TYPES[@]}"
+    if [ "$segs" -eq 0 ]; then
+        run cp "$INPUT" "$OUTPUT"
+        return
+    fi
+    if [ "$segs" -eq 1 ] && [ "${SEG_TYPES[0]}" = ffmpeg ]; then
+        run ffmpeg -y -v error -i "$INPUT" -vf "${SEG_ARGS[0]}" "$OUTPUT"
+        return
+    fi
+    local tmp=$(mktemp -d)
+    CLEANUP="$tmp"
+    local cur="in" next i
+    for ((i = 0; i < segs; i++)); do
+        next=$((i + 1))
+        if [ "${SEG_TYPES[$i]}" = ffmpeg ]; then
+            run ffmpeg -y -v error -i "$tmp/tmp_$cur.png" -vf "${SEG_ARGS[$i]}" "$tmp/tmp_$next.png"
+        else
+            run magick "$tmp/tmp_$cur.png" ${SEG_ARGS[$i]} "$tmp/tmp_$next.png"
+        fi
+        cur=$next
+    done
+    run cp "$tmp/tmp_$cur.png" "$OUTPUT"
+}
+
+get_video_fps() {
+    local vinput="$1" fpsfile="$2" fps="$3" n="$4"
+    if [ -f "$fpsfile" ]; then
+        read "$fps" < "$fpsfile"
+        return
+    fi
+    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1:noesc=1 "$vinput")
+    printf '%s\n' "$fps" > "$fpsfile"
+    eval "$n=$fps"
+}
+
+detect_frame_format() {
+    if magick hald:6 -depth 8 jpg:- > /dev/null 2>&1; then
+        FRAME_EXT=jpg
+        FRAME_CODEC=mjpeg
+        FRAME_CODEC_OPTS="-q:v 2"
+    else
+        FRAME_EXT=png
+        FRAME_CODEC=png
+        FRAME_CODEC_OPTS=""
+    fi
+    log "Frame format: $FRAME_EXT ($FRAME_CODEC)"
+}
+
+video_pass_magick() {
+    local dir="$1" cur="$2" next="$3" marg="$4" jobs=8
+    log "ImageMagick pass: $cur -> $next"
+    local -a files frame
+    mapfile -t files < <(find "$dir" -maxdepth 1 -type f -name "${cur}_?????.${FRAME_EXT}" | sort)
+    local nfiles=${#files[@]}
+    [ "$nfiles" -eq 0 ] && { err "no frames found"; return 1; }
+    
+    local batch_size=$(( (nfiles + jobs - 1) / jobs ))
+    local pids=() batch start end batch_num
+    for ((batch_num = 0; batch_num < jobs; batch_num++)); do
+        start=$((batch_num * batch_size))
+        end=$(((batch_num + 1) * batch_size))
+        [ "$end" -gt "$nfiles" ] && end="$nfiles"
+        [ "$start" -ge "$nfiles" ] && break
+        (
+            for ((i = start; i < end; i++)); do
+                local f="${files[$i]}" name idx out
+                name=$(basename "$f" .${FRAME_EXT})
+                idx=${name#${cur}_}
+                out="$dir/${next}_${idx}.${FRAME_EXT}"
+                run magick "$f" $marg "$out"
+            done
+        ) &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || return 1; done
+}
+
+process_video() {
+    local segs="${#SEG_TYPES[@]}" tmpdir fps fpsfile
+    if [ "$segs" -eq 0 ]; then
+        run cp "$INPUT" "$OUTPUT"
+        return
+    fi
+    if [ "$segs" -eq 1 ] && [ "${SEG_TYPES[0]}" = ffmpeg ]; then
+        run ffmpeg -y -v error -i "$INPUT" -vf "${SEG_ARGS[0]}" "$OUTPUT"
+        return
+    fi
+    tmpdir=$(mktemp -d)
+    CLEANUP="$tmpdir"
+    detect_frame_format
+    fpsfile="$tmpdir/fps.txt"
+    get_video_fps "$INPUT" "$fpsfile" fps fps
+    log "Extracting frames at $fps fps"
+    run ffmpeg -y -v error -i "$INPUT" -vf fps="$fps" -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$tmpdir/in_%05d.${FRAME_EXT}"
+    
+    local cur="in" next i
+    for ((i = 0; i < segs; i++)); do
+        next=$((i + 1))
+        if [ "${SEG_TYPES[$i]}" = ffmpeg ]; then
+            video_pass_ffmpeg "$tmpdir" "$cur" "$next" "${SEG_ARGS[$i]}"
+        else
+            video_pass_magick "$tmpdir" "$cur" "$next" "${SEG_ARGS[$i]}"
+        fi
+        cur=$next
+    done
+    
+    log "Assembling video from frames"
+    run ffmpeg -y -v error -framerate "$fps" -start_number 0 -i "$tmpdir/${cur}_%05d.${FRAME_EXT}" \
+        -c:v libx264 -pix_fmt yuv420p "$OUTPUT"
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --invert) add_fx invert;;
+            --invertlum) add_fx invertlum;;
+            --fisheye) shift; add_fx fisheye "${1:-1}";;
+            --hsv) shift; add_fx hsv "$1";;
+            --hue) shift; add_fx hue "${1:-90}";;
+            --explode) shift; add_fx explode "${1:-1.0}";;
+            --swirl) shift; add_fx swirl "${1:-45}";;
+            --hflip) add_fx hflip;;
+            --vflip) add_fx vflip;;
+            --rotate) shift; add_fx rotate "${1:-90}";;
+            --magik) add_fx magik;;
+            --haah) add_fx haah;;
+            --waaw) add_fx waaw;;
+            --hooh) add_fx hooh;;
+            --woow) add_fx woow;;
+            --stretch) shift; add_fx stretch "${1:-1.1,1.1}";;
+            --resize) shift; add_fx resize "$1";;
+            --derain) add_fx derain;;
+            --rain) add_fx rain;;
+            --bgr) add_fx bgr;;
+            --wave) shift; add_fx wave "$(pad_wave "${1:-3.2,3.2,0.05,0.05,0.628,0.628,0,0}")";;
+            --hidelogs) HIDE=1;;
+            --help) help; exit 0;;
+            install) install_me; exit 0;;
+            *)
+                if [ -z "$INPUT" ]; then INPUT="$1"
+                elif [ -z "$OUTPUT" ]; then OUTPUT="$1"
+                else err "unknown argument: $1"
+                fi
+                ;;
+        esac
+        shift
+    done
+    
+    if [ -z "$INPUT" ] || [ -z "$OUTPUT" ]; then
+        help >&2; exit 1
+    fi
+    if [ ! -f "$INPUT" ]; then
+        err "input file not found: $INPUT"
+    fi
+}
+
+main() {
+    parse_args "$@"
+    log "Input: $INPUT, Output: $OUTPUT"
+    
+    local dims
+    if is_img "$INPUT"; then
+        dims=$(identify -format "%wx%h" "$INPUT")
+        log "Image dimensions: $dims"
+        build_segments "$dims"
+        for ((i = 0; i < ${#FX_TYPES[@]}; i++)); do
+            write_effect_c "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}"
+        done
+        process_image
+    elif is_vid "$INPUT"; then
+        dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$INPUT" | tr ',' 'x')
+        log "Video dimensions: $dims"
+        build_segments "$dims"
+        for ((i = 0; i < ${#FX_TYPES[@]}; i++)); do
+            write_effect_c "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}"
+        done
+        process_video
+    else
+        err "unsupported file type: $(ext "$INPUT")"
+    fi
+    log "Done: $OUTPUT"
+}
+
+main "$@"
